@@ -1,0 +1,26 @@
+node_modules/
+dist/
+.vercel/
+.tanstack/
+.vinxi/
+.output/
+.nitro/
+screenshots/*
+*.log
+.DS_Store
+
+# Never commit real secrets
+.env
+.env.local
+.env.*.local
+
+# Sandbox/workspace scratch, not app source
+project.zip
+attachments/
+artifacts/
+
+# Grok platform tooling docs (game-building/sprite-gen/etc skill guides) —
+# unrelated to this app; only app-env.json is actually read at build time
+.grok/skills/
+.grok/references/
+.grok/status
