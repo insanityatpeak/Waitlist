@@ -111,7 +111,19 @@ function main(argv) {
     process.exit(2);
   }
   const env = mergeAppEnv(readAppEnv(projectRoot()), process.env);
-  const child = spawn(command, args, { stdio: "inherit", env });
+  // On Windows, a locally-installed bin like `vite` resolves to a `.cmd`/`.ps1`
+  // shim; spawn() without a shell can't find it (ENOENT) even though it's on
+  // PATH. `shell: true` routes through cmd.exe there and is a no-op wrapper
+  // (`/bin/sh -c`) elsewhere, so this is safe on both — but cmd.exe needs the
+  // command quoted or it misparses a path containing spaces (e.g. `C:\Program
+  // Files\nodejs\node.exe`) as separate tokens.
+  const isWindows = process.platform === "win32";
+  const spawnCommand = isWindows && command.includes(" ") ? `"${command}"` : command;
+  const child = spawn(spawnCommand, args, {
+    stdio: "inherit",
+    env,
+    shell: isWindows,
+  });
   // The dev server is long-running and is stopped by signalling this wrapper.
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     process.on(signal, () => child.kill(signal));
