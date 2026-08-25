@@ -15,7 +15,11 @@ export const Route = createFileRoute("/category/$slug")({
     const listings = PREVIEW_LISTINGS.filter(
       (l) => l.categorySlug === params.slug,
     );
-    return { category, stats, mine, listings };
+    // Only serializable values may cross the loader boundary. `category.icon`
+    // is a React component, and dehydrating it throws SerovalUnsupportedType,
+    // which blanks the page on hydration — pass the slug and look the icon up
+    // in the component instead.
+    return { slug: category.slug, name: category.name, stats, mine, listings };
   },
   component: CategoryPage,
   notFoundComponent: () => (
@@ -34,8 +38,8 @@ export const Route = createFileRoute("/category/$slug")({
 });
 
 function CategoryPage() {
-  const { category, stats, mine, listings } = Route.useLoaderData();
-  const Icon = category.icon;
+  const { slug, name, stats, mine, listings } = Route.useLoaderData();
+  const Icon = categoryBySlug(slug)?.icon;
   const initialSpot: Spot | null = mine
     ? {
         handle: mine.handle,
@@ -55,10 +59,10 @@ function CategoryPage() {
         </p>
         <div className="mt-3 flex items-center gap-3">
           <span className="grid size-12 place-items-center rounded-full bg-peach">
-            <Icon className="size-5 text-accent" />
+            {Icon ? <Icon className="size-5 text-accent" /> : null}
           </span>
           <h1 className="font-display text-3xl font-semibold tracking-tight text-fg sm:text-4xl">
-            {category.name}
+            {name}
           </h1>
         </div>
         <p className="mt-4 max-w-xl text-[15px] leading-relaxed text-muted">
