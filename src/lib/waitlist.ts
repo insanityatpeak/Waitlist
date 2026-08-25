@@ -54,15 +54,29 @@ function isUniqueViolation(err: unknown, constraint?: string): boolean {
   return (err as { constraint?: unknown }).constraint === constraint;
 }
 
-// In-memory sliding-window rate limiter. Good enough to blunt casual abuse;
-// note it resets on cold start / doesn't share state across serverless
-// instances, so it's a first line of defense, not a hard guarantee at scale
-// (swap for Upstash Redis if abuse becomes a real problem post-launch).
+// In-memory sliding-window rate limiter. This is a cheap FIRST PASS only:
+// each serverless instance keeps its own Map and instances recycle, so the
+// effective limit multiplies by the number of live instances. The enforcing
+// limit belongs at the edge (Vercel Firewall) — see docs/SECURITY.md.
+// Entries are swept so a flood of unique keys can't exhaust instance memory.
+const RATE_WINDOW_MS = 60_000;
+const MAX_RATE_KEYS = 10_000;
 const rateBuckets = new Map<string, number[]>();
 
-function hitRateLimit(key: string, max: number, windowMs: number): boolean {
+/** Drop keys whose hits have all aged out; clear outright as a last resort. */
+function sweepRateBuckets(now: number) {
+  for (const [key, times] of rateBuckets) {
+    if (times.every((t) => now - t >= RATE_WINDOW_MS)) rateBuckets.delete(key);
+  }
+  if (rateBuckets.size > MAX_RATE_KEYS) rateBuckets.clear();
+}
+
+function hitRateLimit(key: string, max: number): boolean {
   const now = Date.now();
-  const hits = (rateBuckets.get(key) ?? []).filter((t) => now - t < windowMs);
+  if (rateBuckets.size > MAX_RATE_KEYS) sweepRateBuckets(now);
+  const hits = (rateBuckets.get(key) ?? []).filter(
+    (t) => now - t < RATE_WINDOW_MS,
+  );
   if (hits.length >= max) {
     rateBuckets.set(key, hits);
     return true;
@@ -75,11 +89,22 @@ function hitRateLimit(key: string, max: number, windowMs: number): boolean {
 async function requestIp(): Promise<string> {
   try {
     const { getRequestHeader } = await import("@tanstack/react-start/server");
-    return (
-      getRequestHeader("x-forwarded-for")?.split(",")[0]?.trim() ||
-      getRequestHeader("x-real-ip") ||
-      "unknown"
-    );
+    // Vercel sets x-vercel-forwarded-for itself and strips any client-supplied
+    // copy, so it can't be forged. Never trust the LEFTMOST x-forwarded-for
+    // entry — that's the client-controlled position; when falling back, take
+    // the rightmost (nearest-proxy) entry instead.
+    const vercelIp = getRequestHeader("x-vercel-forwarded-for")?.trim();
+    if (vercelIp) return vercelIp;
+    const chain = getRequestHeader("x-forwarded-for");
+    if (chain) {
+      const parts = chain
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean);
+      const nearest = parts[parts.length - 1];
+      if (nearest) return nearest;
+    }
+    return getRequestHeader("x-real-ip")?.trim() || "unknown";
   } catch {
     return "unknown";
   }
@@ -137,32 +162,42 @@ async function rankForCode(code: string) {
   return rows[0] ?? { position: 0, referrals: 0, total: 0 };
 }
 
+// These stats are identical for every visitor and drive EVERY page load of
+// /, /about and /category/:slug. Without this cache each of those requests
+// scanned the whole table, which made plain GET traffic a cheap way to
+// exhaust the database. One warm instance now serves many requests per query.
+const STATS_TTL_MS = 15_000;
+let statsCache: { at: number; value: WaitlistStats } | null = null;
+
 export const getWaitlistStats = createServerFn({ method: "GET" }).handler(
   async (): Promise<WaitlistStats> => {
+    if (statsCache && Date.now() - statsCache.at < STATS_TTL_MS) {
+      return statsCache.value;
+    }
     try {
       const { getSql } = await import("@/lib/db");
       const sql = await getSql();
       const totals = await sql<{ n: number }>`select count(*)::int as n from waitlist`;
+      // One grouped aggregate joined once, rather than a correlated subquery
+      // re-counting referrals for every row.
       const top = await sql<{
         handle: string;
         referrals: number;
         created_at: string;
       }>`
-        with counts as (
-          select
-            w.id,
-            w.handle,
-            w.created_at,
-            (
-              select count(*)::int
-              from waitlist x
-              where x.referred_by_code = w.referral_code
-            ) as referrals
-          from waitlist w
+        with ref_counts as (
+          select referred_by_code as code, count(*)::int as cnt
+          from waitlist
+          where referred_by_code is not null
+          group by referred_by_code
         )
-        select handle, referrals, created_at::text as created_at
-        from counts
-        order by referrals desc, created_at asc, id asc
+        select
+          w.handle,
+          coalesce(r.cnt, 0)::int as referrals,
+          w.created_at::text as created_at
+        from waitlist w
+        left join ref_counts r on r.code = w.referral_code
+        order by referrals desc, w.created_at asc, w.id asc
         limit 10
       `;
       const recent = await sql<{ handle: string; created_at: string }>`
@@ -171,7 +206,7 @@ export const getWaitlistStats = createServerFn({ method: "GET" }).handler(
         order by created_at desc
         limit 8
       `;
-      return {
+      const value: WaitlistStats = {
         total: totals[0]?.n ?? 0,
         top: top.map((row) => ({
           handle: row.handle,
@@ -186,8 +221,11 @@ export const getWaitlistStats = createServerFn({ method: "GET" }).handler(
           ago: timeAgo(row.created_at),
         })),
       };
+      statsCache = { at: Date.now(), value };
+      return value;
     } catch {
-      return { total: 0, top: [], recent: [] };
+      // Prefer a stale snapshot over blanking the board on a transient failure.
+      return statsCache?.value ?? { total: 0, top: [], recent: [] };
     }
   },
 );
@@ -197,7 +235,13 @@ export const getMySpot = createServerFn({ method: "GET" }).handler(async () => {
     const { getCookie } = await import("@tanstack/react-start/server");
     const { getSql } = await import("@/lib/db");
     const code = getCookie(COOKIE);
-    if (!code) return null;
+    // The cookie is client-supplied, so reject anything that isn't a
+    // well-formed code before spending a query on it. This path is not
+    // cacheable (it's per-visitor) and rankForCode scans the table, so it
+    // also gets a per-IP ceiling — generous enough for real browsing.
+    if (!code || !/^[A-Z0-9]{8}$/.test(code)) return null;
+    const ip = await requestIp();
+    if (hitRateLimit(`spot:ip:${ip}`, 60)) return null;
     const sql = await getSql();
     const rows = await sql<{ handle: string; referral_code: string }>`
       select handle, referral_code from waitlist where referral_code = ${code} limit 1
@@ -229,7 +273,7 @@ export const joinWaitlist = createServerFn({ method: "POST" })
 
     // Per-IP: 20 join attempts/min (covers shared networks). Per-email: 5/min
     // (slows down enumeration probing a specific address).
-    if (hitRateLimit(`ip:${ip}`, 20, 60_000) || hitRateLimit(`email:${email}`, 5, 60_000)) {
+    if (hitRateLimit(`join:ip:${ip}`, 20) || hitRateLimit(`join:email:${email}`, 5)) {
       throw new WaitlistError("Too many attempts. Please wait a moment and try again.");
     }
 
