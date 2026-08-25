@@ -54,10 +54,15 @@ function injectHeadStreaming(response: Response, host: string): Response {
   const headers = new Headers(response.headers);
   headers.delete("content-length");
 
-  // Security headers
+  // Security headers.
+  // script-src needs 'unsafe-inline': TanStack Start streams hydration data
+  // and the theme-boot script as inline <script> tags with no nonce/hash
+  // plumbing in this app, and a strict CSP without it silently blocks
+  // hydration (React never mounts -> blank page). https://grok.com is the
+  // required "Created with Grok" branding script — never remove that origin.
   headers.set("Content-Security-Policy",
     "default-src 'self'; " +
-    "script-src 'self' https://fonts.googleapis.com; " +
+    "script-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://grok.com; " +
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
     "font-src https://fonts.gstatic.com; " +
     "img-src 'self' data: https:; " +
